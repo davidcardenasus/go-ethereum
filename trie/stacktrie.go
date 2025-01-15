@@ -17,11 +17,12 @@
 package trie
 
 import (
+	"bytes"
+	"errors"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 var (
@@ -29,65 +30,64 @@ var (
 	_      = types.TrieHasher((*StackTrie)(nil))
 )
 
-// StackTrieOptions contains the configured options for manipulating the stackTrie.
-type StackTrieOptions struct {
-	Writer func(path []byte, hash common.Hash, blob []byte) // The function to commit the dirty nodes
-}
-
-// NewStackTrieOptions initializes an empty options for stackTrie.
-func NewStackTrieOptions() *StackTrieOptions { return &StackTrieOptions{} }
-
-// WithWriter configures trie node writer within the options.
-func (o *StackTrieOptions) WithWriter(writer func(path []byte, hash common.Hash, blob []byte)) *StackTrieOptions {
-	o.Writer = writer
-	return o
-}
+// OnTrieNode is a callback method invoked when a trie node is committed
+// by the stack trie. The node is only committed if it's considered complete.
+//
+// The caller should not modify the contents of the returned path and blob
+// slice, and their contents may be changed after the call. It is up to the
+// `onTrieNode` receiver function to deep-copy the data if it wants to retain
+// it after the call ends.
+type OnTrieNode func(path []byte, hash common.Hash, blob []byte)
 
 // StackTrie is a trie implementation that expects keys to be inserted
 // in order. Once it determines that a subtree will no longer be inserted
 // into, it will hash it and free up the memory it uses.
 type StackTrie struct {
-	options *StackTrieOptions
-	root    *stNode
-	h       *hasher
+	root       *stNode
+	h          *hasher
+	last       []byte
+	onTrieNode OnTrieNode
 }
 
-// NewStackTrie allocates and initializes an empty trie.
-func NewStackTrie(options *StackTrieOptions) *StackTrie {
-	if options == nil {
-		options = NewStackTrieOptions()
-	}
+// NewStackTrie allocates and initializes an empty trie. The committed nodes
+// will be discarded immediately if no callback is configured.
+func NewStackTrie(onTrieNode OnTrieNode) *StackTrie {
 	return &StackTrie{
-		options: options,
-		root:    stPool.Get().(*stNode),
-		h:       newHasher(false),
+		root:       stPool.Get().(*stNode),
+		h:          newHasher(false),
+		onTrieNode: onTrieNode,
 	}
 }
 
 // Update inserts a (key, value) pair into the stack trie.
 func (t *StackTrie) Update(key, value []byte) error {
-	k := keybytesToHex(key)
 	if len(value) == 0 {
-		panic("deletion not supported")
+		return errors.New("trying to insert empty (deletion)")
 	}
-	k = k[:len(k)-1] // chop the termination flag
-
+	k := t.TrieKey(key)
+	if bytes.Compare(t.last, k) >= 0 {
+		return errors.New("non-ascending key order")
+	}
+	if t.last == nil {
+		t.last = append([]byte{}, k...) // allocate key slice
+	} else {
+		t.last = append(t.last[:0], k...) // reuse key slice
+	}
 	t.insert(t.root, k, value, nil)
 	return nil
 }
 
-// MustUpdate is a wrapper of Update and will omit any encountered error but
-// just print out an error message.
-func (t *StackTrie) MustUpdate(key, value []byte) {
-	if err := t.Update(key, value); err != nil {
-		log.Error("Unhandled trie error in StackTrie.Update", "err", err)
-	}
-}
-
 // Reset resets the stack trie object to empty state.
 func (t *StackTrie) Reset() {
-	t.options = NewStackTrieOptions()
 	t.root = stPool.Get().(*stNode)
+	t.last = nil
+}
+
+// TrieKey returns the internal key representation for the given user key.
+func (t *StackTrie) TrieKey(key []byte) []byte {
+	k := keybytesToHex(key)
+	k = k[:len(k)-1] // chop the termination flag
+	return k
 }
 
 // stNode represents a node within a StackTrie
@@ -307,7 +307,6 @@ func (t *StackTrie) insert(st *stNode, key, value []byte, path []byte) {
 // This method also sets 'st.type' to hashedNode, and clears 'st.key'.
 func (t *StackTrie) hash(st *stNode, path []byte) {
 	var blob []byte // RLP-encoded node blob
-
 	switch st.typ {
 	case hashedNode:
 		return
@@ -365,11 +364,12 @@ func (t *StackTrie) hash(st *stNode, path []byte) {
 	default:
 		panic("invalid node type")
 	}
-
+	// Convert the node type to hashNode and reset the key slice.
 	st.typ = hashedNode
 	st.key = st.key[:0]
 
-	// Skip committing the non-root node if the size is smaller than 32 bytes.
+	// Skip committing the non-root node if the size is smaller than 32 bytes
+	// as tiny nodes are always embedded in their parent except root node.
 	if len(blob) < 32 && len(path) > 0 {
 		st.val = common.CopyBytes(blob)
 		return
@@ -378,28 +378,20 @@ func (t *StackTrie) hash(st *stNode, path []byte) {
 	// input values.
 	st.val = t.h.hashData(blob)
 
-	// Commit the trie node if the writer is configured.
-	if t.options.Writer != nil {
-		t.options.Writer(path, common.BytesToHash(st.val), blob)
+	// Invoke the callback it's provided. Notably, the path and blob slices are
+	// volatile, please deep-copy the slices in callback if the contents need
+	// to be retained.
+	if t.onTrieNode != nil {
+		t.onTrieNode(path, common.BytesToHash(st.val), blob)
 	}
 }
 
 // Hash will firstly hash the entire trie if it's still not hashed and then commit
-// all nodes to the associated database. Actually most of the trie nodes have been
-// committed already. The main purpose here is to commit the nodes on right boundary.
-//
-// For stack trie, Hash and Commit are functionally identical.
+// all leftover nodes to the associated database. Actually most of the trie nodes
+// have been committed already. The main purpose here is to commit the nodes on
+// right boundary.
 func (t *StackTrie) Hash() common.Hash {
 	n := t.root
 	t.hash(n, nil)
 	return common.BytesToHash(n.val)
-}
-
-// Commit will firstly hash the entire trie if it's still not hashed and then commit
-// all nodes to the associated database. Actually most of the trie nodes have been
-// committed already. The main purpose here is to commit the nodes on right boundary.
-//
-// For stack trie, Hash and Commit are functionally identical.
-func (t *StackTrie) Commit() common.Hash {
-	return t.Hash()
 }
